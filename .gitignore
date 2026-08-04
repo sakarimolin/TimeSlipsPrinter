@@ -1,5 +1,8 @@
-# Prerequisites
-*.d
+
+bin/
+obj/
+packages/
+.vs/
 
 # Object files
 *.o
