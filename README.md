@@ -5,6 +5,8 @@ Windows Forms application for capturing Star Micronics LAN printer traffic from 
 Open `TimeSlipsPrinter.csproj` in Visual Studio 2022 (or newer), press **F5**, and then press
 **Start listening** in the application. It listens on UDP `22222`, TCP `9100`, and TCP `9101`.
 Every packet and print job is saved in the configured capture folder, alongside `events.jsonl`.
+Both received packets/jobs and the emulator's sent replies are written to `events.jsonl`; use the
+`direction` property to distinguish them.
 
 ## First test
 
@@ -16,6 +18,11 @@ Every packet and print job is saved in the configured capture folder, alongside 
 Initially leave both reply fields blank. The first run is capture-only and establishes the exact
 discovery/status data expected by this version of FHRA Slips. If the app permits a manual printer IP,
 enter the PC's IPv4 address and it may send a raw job directly to TCP 9100.
+
+After you have seen a `STR_BCAST` request, you can enable **Send minimal Star SDP probe reply
+(experimental)** and test again. It is enabled by default and replies with the SDP header/version only. If the app then opens a
+TCP 9100 connection, the network path is confirmed; it will still require a model-specific SDP identity
+and printer-status replies before it can consider the virtual printer usable.
 
 ## Reply fields
 

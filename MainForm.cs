@@ -11,6 +11,7 @@ public sealed class MainForm : Form
     private readonly TextBox _captureDirectory = new() { Text = @"D:\Omat\test\TimeSlipsPrinter\captures", Dock = DockStyle.Fill };
     private readonly NumericUpDown _idleSeconds = new() { Minimum = 0.1m, Maximum = 30, DecimalPlaces = 1, Increment = 0.1m, Value = 1.0m, Dock = DockStyle.Left, Width = 110 };
     private readonly TextBox _discoveryReply = new() { Dock = DockStyle.Fill, PlaceholderText = "Optional hex bytes; sent verbatim to UDP discovery requester" };
+    private readonly CheckBox _sendSdpProbe = new() { Text = "Send minimal Star SDP probe reply (experimental)", AutoSize = true, Checked = true };
     private readonly TextBox _statusReply = new() { Dock = DockStyle.Fill, PlaceholderText = "Optional hex bytes; sent after TCP data is received" };
     private readonly CheckBox _echoStatus = new() { Text = "Echo TCP 9101 bytes (diagnostic only)", AutoSize = true };
     private readonly Button _start = new() { Text = "Start listening", AutoSize = true };
@@ -24,6 +25,7 @@ public sealed class MainForm : Form
     private TcpListener? _statusListener;
     private string _activeCaptureDirectory = "";
     private double _activeIdleSeconds;
+    private readonly object _eventFileLock = new();
 
     public MainForm()
     {
@@ -43,6 +45,7 @@ public sealed class MainForm : Form
         AddRow(settings, "Capture folder", _captureDirectory);
         AddRow(settings, "Idle timeout (seconds)", _idleSeconds);
         AddRow(settings, "UDP discovery reply", _discoveryReply);
+        AddRow(settings, "Discovery test", _sendSdpProbe);
         AddRow(settings, "TCP status reply", _statusReply);
         AddRow(settings, "TCP 9101", _echoStatus);
 
@@ -88,6 +91,8 @@ public sealed class MainForm : Form
             MessageBox.Show(this, exception.Message, Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return;
         }
+        if (discoveryReply.Length == 0 && _sendSdpProbe.Checked)
+            discoveryReply = MinimalSdpProbeReply();
 
         try
         {
@@ -111,7 +116,9 @@ public sealed class MainForm : Form
         SetRunning(true);
         WriteLog($"Listening on {address}: UDP 22222, TCP 9100, TCP 9101");
         WriteLog($"Saving captures to {_activeCaptureDirectory}");
-        if (discoveryReply.Length == 0) WriteLog("Discovery reply disabled: capture-only mode.");
+        if (discoveryReply.Length == 0) WriteLog("Discovery reply is OFF: capture-only mode.");
+        else if (_sendSdpProbe.Checked && string.IsNullOrWhiteSpace(_discoveryReply.Text)) WriteLog("Discovery reply is ON: using experimental minimal Star SDP probe reply.");
+        else WriteLog($"Discovery reply is ON: using {discoveryReply.Length} configured hexadecimal bytes.");
         _ = Task.Run(() => ReceiveUdpAsync(discoveryReply, _cancellation.Token));
         _ = Task.Run(() => AcceptTcpAsync(_printListener, "tcp9100_print", statusReply, false, _cancellation.Token));
         _ = Task.Run(() => AcceptTcpAsync(_statusListener, "tcp9101_status", statusReply, _echoStatus.Checked, _cancellation.Token));
@@ -150,7 +157,8 @@ public sealed class MainForm : Form
                 if (reply.Length > 0)
                 {
                     await _udp.SendAsync(reply, result.RemoteEndPoint, cancellationToken);
-                    WriteLog($"Sent configured UDP reply ({reply.Length} bytes) to {result.RemoteEndPoint}");
+                    var replyCapture = SaveCapture("udp22222_reply", result.RemoteEndPoint, reply, "sent");
+                    WriteLog($"Sent configured UDP reply ({reply.Length} bytes) to {result.RemoteEndPoint} → {replyCapture.Name}");
                 }
             }
         }
@@ -181,6 +189,7 @@ public sealed class MainForm : Form
         {
             var peer = (IPEndPoint?)client.Client.RemoteEndPoint ?? new IPEndPoint(IPAddress.None, 0);
             var received = new MemoryStream();
+            var sent = new MemoryStream();
             try
             {
                 using var stream = client.GetStream();
@@ -190,8 +199,16 @@ public sealed class MainForm : Form
                     var count = await ReadWithIdleTimeoutAsync(stream, buffer, cancellationToken);
                     if (count == 0) break;
                     received.Write(buffer, 0, count);
-                    if (reply.Length > 0) await stream.WriteAsync(reply, cancellationToken);
-                    else if (echo) await stream.WriteAsync(buffer.AsMemory(0, count), cancellationToken);
+                    if (reply.Length > 0)
+                    {
+                        await stream.WriteAsync(reply, cancellationToken);
+                        sent.Write(reply, 0, reply.Length);
+                    }
+                    else if (echo)
+                    {
+                        await stream.WriteAsync(buffer.AsMemory(0, count), cancellationToken);
+                        sent.Write(buffer, 0, count);
+                    }
                 }
             }
             catch (OperationCanceledException) { }
@@ -202,6 +219,11 @@ public sealed class MainForm : Form
                 {
                     var saved = SaveCapture(kind, peer, received.ToArray());
                     WriteLog($"Captured {kind} from {peer} ({received.Length} bytes) → {saved.Name}");
+                }
+                if (sent.Length > 0)
+                {
+                    var saved = SaveCapture(kind + "_reply", peer, sent.ToArray(), "sent");
+                    WriteLog($"Captured reply to {peer} ({sent.Length} bytes) → {saved.Name}");
                 }
             }
         }
@@ -215,7 +237,7 @@ public sealed class MainForm : Form
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested) { return 0; }
     }
 
-    private FileInfo SaveCapture(string kind, IPEndPoint peer, byte[] bytes)
+    private FileInfo SaveCapture(string kind, IPEndPoint peer, byte[] bytes, string direction = "received")
     {
         var root = _activeCaptureDirectory;
         Directory.CreateDirectory(root);
@@ -227,13 +249,15 @@ public sealed class MainForm : Form
         {
             capturedAtUtc = DateTimeOffset.UtcNow,
             kind,
+            direction,
             peer = new { address = peer.Address.ToString(), port = peer.Port },
             bytes = bytes.Length,
             file = Path.GetFileName(dataPath),
             hexPreview = Convert.ToHexString(bytes[..Math.Min(bytes.Length, 96)]),
             asciiPreview = Encoding.ASCII.GetString(bytes[..Math.Min(bytes.Length, 96)])
         };
-        File.AppendAllText(Path.Combine(root, "events.jsonl"), JsonSerializer.Serialize(metadata) + Environment.NewLine);
+        lock (_eventFileLock)
+            File.AppendAllText(Path.Combine(root, "events.jsonl"), JsonSerializer.Serialize(metadata) + Environment.NewLine);
         return new FileInfo(dataPath);
     }
 
@@ -252,6 +276,7 @@ public sealed class MainForm : Form
         _captureDirectory.Enabled = !running;
         _idleSeconds.Enabled = !running;
         _discoveryReply.Enabled = !running;
+        _sendSdpProbe.Enabled = !running;
         _statusReply.Enabled = !running;
         _echoStatus.Enabled = !running;
     }
@@ -272,5 +297,13 @@ public sealed class MainForm : Form
         if (compact.Length != input.Count(Uri.IsHexDigit) || compact.Length % 2 != 0)
             throw new FormatException("Hex replies must contain only hexadecimal digits and whitespace, with an even number of digits.");
         return Convert.FromHexString(compact);
+    }
+
+    private static byte[] MinimalSdpProbeReply()
+    {
+        // The matching request is a 16-byte STR_BCAST header followed by RQ1.0.0\0.
+        // This deliberately only proves that the app will advance to the TCP phase; a
+        // production SDP response still needs the model/identity fields from a real trace.
+        return Encoding.ASCII.GetBytes("STR_RSP\0\0\0\0\0\0\0\0\0RS1.0.1\0");
     }
 }
