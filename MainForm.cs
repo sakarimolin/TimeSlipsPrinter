@@ -91,8 +91,7 @@ public sealed class MainForm : Form
             MessageBox.Show(this, exception.Message, Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return;
         }
-        if (discoveryReply.Length == 0 && _sendSdpProbe.Checked)
-            discoveryReply = MinimalSdpProbeReply();
+        var useSdpProbe = discoveryReply.Length == 0 && _sendSdpProbe.Checked;
 
         try
         {
@@ -116,10 +115,10 @@ public sealed class MainForm : Form
         SetRunning(true);
         WriteLog($"Listening on {address}: UDP 22222, TCP 9100, TCP 9101");
         WriteLog($"Saving captures to {_activeCaptureDirectory}");
-        if (discoveryReply.Length == 0) WriteLog("Discovery reply is OFF: capture-only mode.");
-        else if (_sendSdpProbe.Checked && string.IsNullOrWhiteSpace(_discoveryReply.Text)) WriteLog("Discovery reply is ON: using experimental minimal Star SDP probe reply.");
+        if (discoveryReply.Length == 0 && !useSdpProbe) WriteLog("Discovery reply is OFF: capture-only mode.");
+        else if (useSdpProbe) WriteLog("Discovery reply is ON: using experimental request-aware Star SDP probe reply.");
         else WriteLog($"Discovery reply is ON: using {discoveryReply.Length} configured hexadecimal bytes.");
-        _ = Task.Run(() => ReceiveUdpAsync(discoveryReply, _cancellation.Token));
+        _ = Task.Run(() => ReceiveUdpAsync(discoveryReply, useSdpProbe, _cancellation.Token));
         _ = Task.Run(() => AcceptTcpAsync(_printListener, "tcp9100_print", statusReply, false, _cancellation.Token));
         _ = Task.Run(() => AcceptTcpAsync(_statusListener, "tcp9101_status", statusReply, _echoStatus.Checked, _cancellation.Token));
         await Task.CompletedTask;
@@ -145,7 +144,7 @@ public sealed class MainForm : Form
         _statusListener?.Stop(); _statusListener = null;
     }
 
-    private async Task ReceiveUdpAsync(byte[] reply, CancellationToken cancellationToken)
+    private async Task ReceiveUdpAsync(byte[] configuredReply, bool useSdpProbe, CancellationToken cancellationToken)
     {
         try
         {
@@ -154,6 +153,7 @@ public sealed class MainForm : Form
                 var result = await _udp.ReceiveAsync(cancellationToken);
                 var saved = SaveCapture("udp22222", result.RemoteEndPoint, result.Buffer);
                 WriteLog($"UDP discovery from {result.RemoteEndPoint} ({result.Buffer.Length} bytes) → {saved.Name}");
+                var reply = useSdpProbe ? MinimalSdpProbeReply(result.Buffer) : configuredReply;
                 if (reply.Length > 0)
                 {
                     await _udp.SendAsync(reply, result.RemoteEndPoint, cancellationToken);
@@ -299,11 +299,20 @@ public sealed class MainForm : Form
         return Convert.FromHexString(compact);
     }
 
-    private static byte[] MinimalSdpProbeReply()
+    private static byte[] MinimalSdpProbeReply(byte[] request)
     {
-        // The matching request is a 16-byte STR_BCAST header followed by RQ1.0.0\0.
-        // This deliberately only proves that the app will advance to the TCP phase; a
-        // production SDP response still needs the model/identity fields from a real trace.
-        return Encoding.ASCII.GetBytes("STR_RSP\0\0\0\0\0\0\0\0\0RS1.0.1\0");
+        // SDP starts with a 16-byte magic header, then a null-terminated RQx.0.0
+        // revision field. Reply with the corresponding RSx.0.1 field and preserve
+        // the request-specific trailing bytes. This is only a TCP-phase probe: it
+        // does not yet include a model/IP/MAC identity from a real Star printer.
+        if (request.Length < 24 || !request.AsSpan(0, 9).SequenceEqual("STR_BCAST"u8))
+            return [];
+
+        var response = new byte[request.Length];
+        Encoding.ASCII.GetBytes("STR_RSP").CopyTo(response, 0);
+        var revision = request[18]; // RQ1.0.0 or RQ4.0.0
+        Encoding.ASCII.GetBytes($"RS{(char)revision}.0.1\0").CopyTo(response, 16);
+        request.AsSpan(24).CopyTo(response.AsSpan(24));
+        return response;
     }
 }

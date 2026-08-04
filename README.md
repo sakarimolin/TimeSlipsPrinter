@@ -20,7 +20,8 @@ discovery/status data expected by this version of FHRA Slips. If the app permits
 enter the PC's IPv4 address and it may send a raw job directly to TCP 9100.
 
 After you have seen a `STR_BCAST` request, you can enable **Send minimal Star SDP probe reply
-(experimental)** and test again. It is enabled by default and replies with the SDP header/version only. If the app then opens a
+(experimental)** and test again. It is enabled by default and replies with the matching SDP protocol
+revision (`RQ1`/`RQ4` to `RS1`/`RS4`), preserving the trailing request bytes. If the app then opens a
 TCP 9100 connection, the network path is confirmed; it will still require a model-specific SDP identity
 and printer-status replies before it can consider the virtual printer usable.
 
